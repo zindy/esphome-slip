@@ -1,0 +1,47 @@
+esphome:
+  name: slip-node
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_LWIP_SLIP_SUPPORT: "y"
+
+external_components:
+  - source:
+      type: local
+      path: custom_components
+    components: [slip, network]
+
+# No wifi / ethernet. The api component still needs the network component.
+network:
+
+# The logger would share UART0 with the USB bridge and corrupt the SLIP
+# stream, so switch it off completely (baud_rate: 0).
+logger:
+  baud_rate: 0
+
+# UART0 = the USB-serial bridge on a NodeMCU-style ESP32 (GPIO1 TX, GPIO3 RX)
+uart:
+  id: slip_uart
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 115200
+  rx_buffer_size: 1024
+
+slip:
+  uart_id: slip_uart
+  local_ip: 192.168.254.2
+  gateway: 192.168.254.1
+  subnet: 255.255.255.0
+  diagnostics: false  # true = status line on the serial port every 2 s (breaks the link for real traffic)
+
+api:
+  reboot_timeout: 0s   # don't reboot while no client is connected
+
+# Test heartbeat: should show up in `esphome logs` over the SLIP link.
+interval:
+  - interval: 5s
+    then:
+      - logger.log: "hello over SLIP"

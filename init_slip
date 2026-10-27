@@ -1,0 +1,84 @@
+#!/bin/bash
+# Bring up the SLIP link to the ESP32.
+#
+#   sudo ./init_slip DEVICE
+#
+#   host  192.168.254.1  <-- DEVICE, 115200 baud -->  ESP32  192.168.254.2
+#
+# DEVICE is required on purpose: attaching SLIP to the wrong serial port (a
+# Zigbee/Z-Wave stick, for example) would break whatever uses it. Prefer a
+# stable name from /dev/serial/by-path/, because /dev/ttyUSBn numbers change
+# between reboots and re-plugs:
+#
+#   ls -l /dev/serial/by-path/
+#   sudo ./init_slip /dev/serial/by-path/pci-0000:00:14.0-usb-0:3.1:1.0-port0
+#
+# The link stays up until you stop it (sudo pkill slattach). Stop it before
+# flashing the board: slattach holds the serial port.
+
+set -euo pipefail
+
+HOST_IP=192.168.254.1
+ESP_IP=192.168.254.2
+BAUD=115200
+BOOT_WAIT=5   # opening the port resets most dev boards (DTR/RTS); give it time to boot
+
+usage() {
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 1
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+[ $# -eq 1 ] || usage
+DEV=$1
+
+[ "$(id -u)" -eq 0 ] || die "run as root: sudo $0 $DEV"
+[ -c "$DEV" ] || die "$DEV is not a character device (is the board plugged in?)"
+
+REAL=$(readlink -f "$DEV")
+DESC=$(udevadm info -q property -n "$REAL" 2>/dev/null \
+       | grep -E '^ID_(VENDOR|MODEL)_FROM_DATABASE=|^ID_(VENDOR|MODEL)=' | tr '\n' ' ' || true)
+echo "using $DEV -> $REAL ${DESC:+($DESC)}"
+case "$DEV" in
+    /dev/ttyUSB*|/dev/ttyACM*)
+        echo "warning: $DEV can change after a reboot or re-plug; prefer /dev/serial/by-path/..." >&2 ;;
+esac
+
+if pgrep -x slattach >/dev/null; then
+    echo "a slattach is already running:" >&2
+    pgrep -a slattach >&2
+    die "stop it first (sudo pkill slattach) so nothing is attached by mistake"
+fi
+
+if command -v fuser >/dev/null && fuser "$REAL" >/dev/null 2>&1; then
+    die "$REAL is in use by another process (fuser -v $REAL)"
+fi
+
+modprobe slip || die "this kernel has no slip module"
+
+# Detached (own session, no terminal) so the link survives logging out of ssh.
+# slattach's own messages go to the log file below.
+LOG=/tmp/init_slip.slattach.log
+setsid slattach -L -p slip -s "$BAUD" "$DEV" </dev/null >"$LOG" 2>&1 &
+SLATTACH_PID=$!
+trap 'kill "$SLATTACH_PID" 2>/dev/null || true' ERR
+
+# wait for the kernel to create sl0
+for _ in $(seq 20); do
+    ip link show sl0 >/dev/null 2>&1 && break
+    sleep 0.25
+done
+ip link show sl0 >/dev/null 2>&1 || die "sl0 did not appear (slattach failed?)"
+
+ip addr add "$HOST_IP" peer "$ESP_IP" dev sl0
+ip link set sl0 mtu 1500 up
+sleep "$BOOT_WAIT"
+
+if ping -c 2 -W 2 "$ESP_IP" >/dev/null; then
+    echo "link up: $ESP_IP answers"
+else
+    echo "link configured, but $ESP_IP does not answer (yet)" >&2
+    echo "slattach log: $LOG" >&2
+    echo "check: sl0 counters (ip -s link show sl0), correct board on $DEV, and run python3 slip_ping.py to test without slattach" >&2
+fi
