@@ -37,11 +37,100 @@ slip:
   subnet: 255.255.255.0
   diagnostics: false  # true = status line on the serial port every 2 s (breaks the link for real traffic)
 
+# Listen for ESP-NOW broadcasts (the ESP8266 doorbell sender). The ESP32 does
+# no interpretation: every frame is forwarded to Home Assistant as an event
+# (esphome.espnow_broadcast) and all the logic lives in HA automations.
+espnow:
+  channel: 1             # must match the sender's WiFi channel (ESP8266 default: 1)
+  auto_add_peer: true    # frames from senders that are not registered peers are ignored otherwise
+  on_unknown_peer:       # fires for the first frame from each new sender
+    then:
+      - lambda: |-
+          ESP_LOGI("espnow", "new sender %02X:%02X:%02X:%02X:%02X:%02X",
+                   info.src_addr[0], info.src_addr[1], info.src_addr[2],
+                   info.src_addr[3], info.src_addr[4], info.src_addr[5]);
+  on_broadcast:          # fires for every broadcast frame from a known sender
+    then:
+      - lambda: |-
+          char hex[3 * 16 + 1] = {0};
+          for (uint16_t i = 0; i < size && i < 16; i++)
+            snprintf(hex + 3 * i, 4, "%02X ", data[i]);
+          const char *what = size == 0 ? "empty" : data[0] == 0 ? "OFF" : data[0] == 1 ? "ON"
+                           : data[0] == 2 ? "MOMENTARY (doorbell)" : data[0] == 4 ? "SENSOR" : "?";
+          ESP_LOGI("espnow", "broadcast from %02X:%02X:%02X:%02X:%02X:%02X rssi=%d len=%u data=[%s] %s",
+                   info.src_addr[0], info.src_addr[1], info.src_addr[2],
+                   info.src_addr[3], info.src_addr[4], info.src_addr[5],
+                   info.rx_ctrl->rssi, (unsigned) size, hex, what);
+      # Forward the raw frame to Home Assistant. Needs "Allow the device to
+      # perform Home Assistant actions" ticked in the ESPHome integration options.
+      - homeassistant.event:
+          event: esphome.espnow_broadcast
+          data_template:
+            mac: "{{ mac }}"
+            rssi: "{{ rssi }}"
+            len: "{{ len }}"
+            cmd: "{{ cmd }}"
+            payload: "{{ payload }}"
+          variables:
+            mac: !lambda |-
+              char b[18];
+              snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X",
+                       info.src_addr[0], info.src_addr[1], info.src_addr[2],
+                       info.src_addr[3], info.src_addr[4], info.src_addr[5]);
+              return std::string(b);
+            rssi: !lambda |-
+              return (int) info.rx_ctrl->rssi;
+            len: !lambda |-
+              return (int) size;
+            cmd: !lambda |-
+              return size > 0 ? (int) data[0] : -1;
+            payload: !lambda |-
+              static const char *H = "0123456789ABCDEF";
+              std::string s;
+              for (size_t i = 0; i < size && i < 250; i++) {
+                s += H[data[i] >> 4];
+                s += H[data[i] & 15];
+              }
+              return s;
+
 api:
   reboot_timeout: 0s   # don't reboot while no client is connected
 
-# Test heartbeat: should show up in `esphome logs` over the SLIP link.
+# Needed for any upload that is not over USB. The first flash that adds this
+# block still has to be done over USB serial.
+ota:
+  - platform: esphome
+
+# Heartbeat: log line (visible in `esphome logs`) plus a counter published to
+# Home Assistant every 5 s, so HA can tell when the link goes quiet.
+globals:
+  - id: hb_count
+    type: uint32_t
+    initial_value: "0"
+
 interval:
   - interval: 5s
     then:
       - logger.log: "hello over SLIP"
+      - lambda: |-
+          id(hb_count)++;
+          id(heartbeat).publish_state(id(hb_count));
+
+binary_sensor:
+  - platform: status
+    name: Status
+
+sensor:
+  - platform: template
+    id: heartbeat
+    name: Heartbeat
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: never
+  - platform: uptime
+    name: Uptime
+
+button:
+  - platform: restart
+    name: Restart

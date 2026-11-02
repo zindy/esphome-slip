@@ -43,7 +43,38 @@ void SlipComponent::setup() {
   netif_set_link_up(&this->slip_netif_);
   UNLOCK_TCPIP_CORE();
 
-  this->high_freq_.start();
+  // Drain the UART in a dedicated task instead of loop() (see header).
+  xTaskCreate(&SlipComponent::rx_task_, "slip_rx", 3072, this, 5, &this->rx_task_handle_);
+}
+
+// Moves bytes from ESPHome's UART buffer into the queue read by lwIP's SLIP
+// thread. Sleeps one tick between passes so the main loop still gets CPU time.
+void SlipComponent::rx_task_(void *arg) {
+  auto *self = static_cast<SlipComponent *>(arg);
+  uint32_t last = millis();
+  for (;;) {
+    uint32_t now = millis();
+    if (now - last > self->rx_gap_max_)
+      self->rx_gap_max_ = now - last;
+    last = now;
+    while (self->available()) {
+      uint8_t byte;
+      if (!self->read_byte(&byte))
+        break;
+      self->uart_rx_++;
+      if (xQueueSend(self->rx_queue_, &byte, 0) != pdTRUE)  // never block
+        self->queue_drops_++;
+    }
+#if !SLIP_USE_RX_THREAD
+    // lwIP has no SLIP receive thread in this build: hand the queued bytes to
+    // lwIP from here (not from loop(), which is blocked during OTA).
+    slipif_poll(&self->slip_netif_);
+#endif
+    UBaseType_t waiting = uxQueueMessagesWaiting(self->rx_queue_);
+    if (waiting > self->queue_hwm_)
+      self->queue_hwm_ = waiting;
+    vTaskDelay(1);
+  }
 }
 
 void SlipComponent::loop() {
@@ -51,14 +82,21 @@ void SlipComponent::loop() {
   network::custom_interface_connected() =
       netif_is_up(&this->slip_netif_) && netif_is_link_up(&this->slip_netif_);
 
-  // Move bytes from ESPHome's UART buffer into the queue read by lwIP.
-  while (this->available()) {
-    uint8_t byte;
-    if (!this->read_byte(&byte))
-      break;
-    this->uart_rx_++;
-    if (xQueueSend(this->rx_queue_, &byte, 0) != pdTRUE)  // never block
-      this->queue_drops_++;
+  // (UART -> lwIP queue transfer now happens in rx_task_.)
+
+  // After a stall (e.g. during OTA) the main loop resumes here; report what
+  // the receive path did meanwhile. Quiet when everything looks normal.
+  if (millis() - this->last_stats_ >= 5000) {
+    this->last_stats_ = millis();
+    if (this->rx_gap_max_ > 500 || this->queue_hwm_ > 256 || this->queue_drops_ != this->last_drops_) {
+      ESP_LOGW(TAG, "rx_task max gap %u ms, queue high-water %u, queue drops %u (+%u), uart_rx %u, consumed %u",
+               (unsigned) this->rx_gap_max_, (unsigned) this->queue_hwm_, (unsigned) this->queue_drops_,
+               (unsigned) (this->queue_drops_ - this->last_drops_), (unsigned) this->uart_rx_,
+               (unsigned) this->sio_consumed_);
+      this->last_drops_ = this->queue_drops_;
+    }
+    this->rx_gap_max_ = 0;
+    this->queue_hwm_ = 0;
   }
   if (this->diagnostics_ && millis() - this->last_diag_ >= 2000) {
     this->last_diag_ = millis();
@@ -74,10 +112,6 @@ void SlipComponent::loop() {
     this->write_str(buf);
     this->write_byte(0xC0);
   }
-#if !SLIP_USE_RX_THREAD
-  // If lwIP was built without the RX thread, poll for received bytes.
-  slipif_poll(&this->slip_netif_);
-#endif
 }
 
 void SlipComponent::dump_config() {
@@ -85,6 +119,11 @@ void SlipComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Local IP: %s", this->local_ip_str_.c_str());
   ESP_LOGCONFIG(TAG, "  Gateway: %s", this->gateway_str_.c_str());
   ESP_LOGCONFIG(TAG, "  Subnet: %s", this->subnet_str_.c_str());
+#if SLIP_USE_RX_THREAD
+  ESP_LOGCONFIG(TAG, "  lwIP SLIP RX thread: yes (SLIP_USE_RX_THREAD=1)");
+#else
+  ESP_LOGCONFIG(TAG, "  lwIP SLIP RX thread: no, polled from rx_task (SLIP_USE_RX_THREAD=0)");
+#endif
 }
 
 }  // namespace slip

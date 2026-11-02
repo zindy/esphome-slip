@@ -6,6 +6,7 @@
 #include "lwip/netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 #include <string>
 
 namespace esphome {
@@ -42,8 +43,19 @@ class SlipComponent : public Component, public uart::UARTDevice {
   bool diagnostics_{false};
   uint32_t last_diag_{0};
   struct netif slip_netif_;
-  // Run loop() as often as possible so the UART buffer is drained quickly.
-  HighFrequencyLoopRequester high_freq_;
+
+  // Own task that drains the UART into rx_queue_ and, when lwIP has no SLIP
+  // receive thread of its own, runs slipif_poll() to hand packets to lwIP.
+  // It must not depend on loop(): the main loop is blocked while an OTA
+  // upload is being received, and the link has to keep flowing for it.
+  TaskHandle_t rx_task_handle_{nullptr};
+  static void rx_task_(void *arg);
+
+  // Stall diagnostics, logged from loop() once the main loop runs again.
+  volatile uint32_t rx_gap_max_{0};   // longest pause between two passes of rx_task_ (ms)
+  volatile uint32_t queue_hwm_{0};    // most bytes seen waiting in rx_queue_
+  uint32_t last_stats_{0};
+  uint32_t last_drops_{0};
 };
 
 }  // namespace slip

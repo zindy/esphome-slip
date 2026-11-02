@@ -1,0 +1,33 @@
+name: SLIP gateway
+version: "0.1.0"
+slug: slip_gateway
+description: SLIP serial link to an ESP32 (ESPHome), exposed as 192.168.254.1 <-> 192.168.254.2
+arch:
+  - amd64
+  - aarch64
+  - armv7
+init: false
+startup: system
+boot: auto
+host_network: true
+privileged:
+  - NET_ADMIN
+devices:
+  - /dev/net/tun
+uart: true
+options:
+  device: /dev/ttyUSB0
+  baud: 115200
+  ifname: slip0
+  local_ip: 192.168.254.1
+  peer_ip: 192.168.254.2
+  mtu: 1500
+  trace_port: 0
+schema:
+  device: str
+  baud: int
+  ifname: str
+  local_ip: str
+  peer_ip: str
+  mtu: int
+  trace_port: int
