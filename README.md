@@ -297,10 +297,15 @@ under Settings → Apps.)
    built on the machine itself, which takes a minute or two and needs internet
    access.
 4. Plug in the ESP32 (flashed as described above). In the app's Configuration
-   tab set `device` to the board's serial port (Settings → System → Hardware
-   lists the serial devices; the default is `/dev/ttyUSB0`). Prefer a stable
-   `/dev/serial/by-id/...` path if the app can see one, because `ttyUSBn`
-   numbers change when devices are re-plugged.
+   tab set `device` to the board's serial port. **Use a stable
+   `/dev/serial/by-id/...` path, not `/dev/ttyUSB0`**: `ttyUSBn` numbers change
+   between reboots as soon as more than one USB serial adapter is attached, and
+   the app would then write SLIP to the wrong one. The app's Log tab lists the
+   serial ports it can see, with their by-id names, every time it starts. A
+   `by-id` path can also be copied from the device picker of an integration
+   such as DSMR (without completing the setup), or from Settings → System →
+   Hardware. Two identical adapters that report the same serial number cannot
+   be told apart by their by-id names.
 5. Start the app. Enable *Start on boot* and *Watchdog*.
 6. Check the app's Log tab: you should see `slip0 up: 192.168.254.1 <->
    192.168.254.2` and `serial open: ...`. From the Terminal & SSH app,
@@ -324,13 +329,40 @@ the local install above is the one that was used.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `device` | `/dev/ttyUSB0` | Serial port of the ESP32's USB bridge |
+| `device` | `/dev/ttyUSB0` | Serial port of the ESP32's USB bridge: a path, preferably `/dev/serial/by-id/...`, or a glob such as `/dev/serial/by-id/usb-Silicon_Labs_CP2102*`. A glob must match exactly one port; otherwise the app logs the candidates and waits |
 | `baud` | `115200` | Must match `uart: baud_rate` in the firmware |
 | `ifname` | `slip0` | Name of the TUN interface |
 | `local_ip` | `192.168.254.1` | The host end (must match `slip: gateway`) |
 | `peer_ip` | `192.168.254.2` | The ESP end (must match `slip: local_ip`) |
 | `mtu` | `1500` | Interface MTU |
+| `announce_name` | *(off)* | Optional, **untested on a real network**. A board name such as `slip-node`: the app then answers mDNS for `slip-node.local` with `peer_ip`, so tools that look the board up by name can find it (see below). One name per app, because one app serves one serial port and one board |
 | `trace_port` | `0` | If non-zero, log one line per TCP packet to or from that port (for debugging; `3232` is the OTA port) |
+
+### Optional: announcing the board's name
+
+The board cannot speak mDNS to the LAN, so the ESPHome Device Builder dashboard
+reports it as offline. With `announce_name: slip-node` set in the app's options, the app
+answers mDNS queries for `slip-node.local` with the board's point-to-point
+address (using the Python `zeroconf` library). It publishes only that
+name-to-address record, under a private service type (`_slipgateway._tcp`), so
+Home Assistant's own ESPHome discovery is not triggered. The log shows
+`mDNS: announcing slip-node.local -> 192.168.254.2`.
+
+Things to know:
+
+- **The app does not learn the name by itself.** You type it in; it has to match
+  the `esphome: name:` in your YAML.
+- **The address is only reachable from the Home Assistant machine.** Other
+  devices on the LAN that look the name up will get an address they cannot reach.
+- **What it does and does not fix.** With the name announced, the Device Builder
+  shows the device as online and prefills `192.168.254.2` in the install
+  dialog's advanced host field. It does **not** make the plain "Wirelessly"
+  button work (see [OTA updates](#ota-updates-over-the-link)), and `ping
+  slip-node` still fails in the Terminal & SSH app, whose resolver does not do
+  mDNS; the Device Builder uses ESPHome's own mDNS client.
+- **A new option needs the app to be updated, not just rebuilt.** The app
+  version was raised to 0.2.0 in `config.yaml` for that reason: reload the app
+  store, update the app, then set the option.
 
 ### What the app logs
 
@@ -355,9 +387,10 @@ Anything that keeps growing is worth a look.
   board.
 - The app has been tested on one Home Assistant OS machine. `config.yaml`
   declares `amd64`, `aarch64` and `armv7`, but I have only run it on one of them.
-- Name resolution does not work across the link: `ping slip-node` fails on the
-  Home Assistant host, and Home Assistant's ESPHome integration has to be given
-  the IP address.
+- Name resolution does not work across the link by default: `ping slip-node`
+  fails on the Home Assistant host, and Home Assistant's ESPHome integration has
+  to be given the IP address. The optional `announce_name` setting tries to
+  improve this for the Device Builder (see above).
 
 ## Using the board from Home Assistant
 
@@ -475,20 +508,26 @@ Firmware updates work over the SLIP link, from the ESPHome Device Builder app.
    on your version of the app.
 3. Build as usual. The first build downloads the ESP-IDF toolchain and takes a
    while.
-4. In the install dialog choose the option to install to a host and type
-   `192.168.254.2`. **Do not use the default `slip-node.local`**: it does not
-   resolve.
+4. Use Install → Wirelessly → *advanced* and enter `192.168.254.2` as the host
+   (with `announce_name` set the field is prefilled with it). **The plain
+   "Wirelessly" button does not work**: it fails with `All specified devices
+   ['OTA'] could not be resolved`, because ESPHome takes the default OTA address
+   only from `use_address` in a `wifi:`, `ethernet:` or `openthread:` block (I
+   checked this in the ESPHome 2026.10.1 source), and this configuration has
+   none of them.
 5. Keep the gateway app running. The link is serial-limited, so the upload
    is slow: in one run the 742 KB image (514 KB compressed) took 82 s to upload,
    and the whole update 83 s. The heartbeat and events pause while the upload is
    being received.
 
-The Device Builder dashboard will show the device as **offline** and say that
-the configuration has "no network component". That is cosmetic. The dashboard
-decides whether a device is online by resolving and pinging its name, and the
-only addresses it knows about come from WiFi, Ethernet and OpenThread. Installing
-to the IP address bypasses all of it, and a device that says "offline" updated
-fine.
+Without the optional name announcement, the Device Builder dashboard shows the
+device as **offline** and says that the configuration has "no network
+component". That is cosmetic. The dashboard decides whether a device is online
+by resolving and pinging its name, and the only addresses it knows about come
+from WiFi, Ethernet and OpenThread. Installing to the IP address bypasses all of
+it, and a device that says "offline" updated fine. With
+[`announce_name`](#optional-announcing-the-boards-name) the card shows the
+device as online.
 
 From a Linux host with the link up, `esphome run my_device.yaml --device
 192.168.254.2` should do the same job. I did not test that exact form (the
@@ -544,7 +583,8 @@ If you hit one of these, you now know the cause.
 | No "Add-ons" in Settings (Home Assistant 2026.2 and later) | Renamed | Look under Settings → Apps |
 | `ping slip-node` or `slip-node.local` fails on the Home Assistant host | mDNS does not cross the link and nothing registers the name | Use the IP address |
 | ESP-NOW frames reach the log but no event shows up in Home Assistant | The device is not allowed to perform Home Assistant actions | Tick "Allow the device to perform Home Assistant actions" in the ESPHome integration options |
-| OTA from the dashboard never starts; the card says offline and `slip-node.local` does not resolve | The dashboard finds devices through mDNS/ping of the name | In the install dialog type the IP address as host |
+| OTA from the dashboard never starts; the card says offline and `slip-node.local` does not resolve | The dashboard finds devices through mDNS/ping of the name | Set `announce_name` in the gateway app (the card then shows online), or type the IP address as host in Install → Wirelessly → advanced |
+| Plain "Wirelessly" install: `All specified devices ['OTA'] could not be resolved ... set 'use_address' in your network config` | ESPHome's default OTA address comes only from `use_address` in `wifi:`, `ethernet:` or `openthread:`, and there is none here | Use Install → Wirelessly → advanced and enter the IP address |
 | OTA connects, handshake completes, then `ERROR receiving update prepare result: Unknown error from ESP`; the device log shows `Read OTA type failed` after about 106 s | The receive path ran in `loop()`, which is blocked while the OTA handler waits for data: incoming bytes filled the queue, the next bytes never reached the handler, and it timed out. `rx_task max gap` stayed tiny while `queue drops` grew by thousands, `consumed` stayed far below `uart_rx`, and pings sent during the stall were answered only afterwards | Run `slipif_poll()` from `rx_task_` instead of `loop()` (done in this repository) |
 | `WARNING [api] The 'variables' value ... is missing the !lambda tag` when compiling | ESPHome now wants the `!lambda` tag on lambdas under `homeassistant.event` `variables`; untagged ones are compiled as lambdas for now but will be sent as literal text from ESPHome 2027.3.0 | Write `mac: !lambda \|-` (etc.), as in `my_device.yaml` |
 | An option added to the gateway app's `config.yaml` vanishes when saved in the app's YAML editor | The installed app keeps its old option list | Bump `version` and update the app, or put the default in `slipgw.py` and rebuild |

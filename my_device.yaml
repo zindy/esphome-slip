@@ -7,6 +7,12 @@ esp32:
     type: esp-idf
     sdkconfig_options:
       CONFIG_LWIP_SLIP_SUPPORT: "y"
+  flash_size: 4MB
+
+light:
+  - platform: status_led
+    name: "Device Status LED"
+    pin: GPIO10
 
 external_components:
   - source:
@@ -95,7 +101,19 @@ espnow:
 
 api:
   reboot_timeout: 0s   # don't reboot while no client is connected
-
+  actions:
+    - action: send_espnow
+      variables:
+        cmd: int
+        sample: int
+      then:
+        - espnow.broadcast:
+            data: !lambda |-
+              std::vector<uint8_t> v{(uint8_t) cmd};
+              if (sample >= 0)
+                v.push_back((uint8_t) sample);
+              return v;
+              
 # Needed for any upload that is not over USB. The first flash that adds this
 # block still has to be done over USB serial.
 ota:

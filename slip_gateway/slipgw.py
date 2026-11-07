@@ -6,9 +6,11 @@ the gateway address, and shuttles IPv4 packets between the two using SLIP
 framing (RFC 1055). No kernel SLIP driver or slattach needed.
 """
 import fcntl
+import glob
 import json
 import os
 import select
+import socket
 import struct
 import subprocess
 import sys
@@ -29,6 +31,7 @@ OPTS = {
     "peer_ip": "192.168.254.2",
     "mtu": 1500,
     "trace_port": 0,  # >0: log one line per TCP packet to/from this port (0 = off)
+    "announce_name": "",  # e.g. "slip-node": answer mDNS for slip-node.local with peer_ip (empty = off)
 }
 
 
@@ -102,9 +105,73 @@ def ip(*args):
     subprocess.run(["ip", *args], check=True)
 
 
-def open_serial():
+def start_announcer():
+    """Optionally answer mDNS for <announce_name>.local with the peer's IP.
+
+    The ESP32 cannot speak mDNS to the LAN, so tools that look the board up by
+    name (the ESPHome dashboard's default install and status check) never find
+    it. This publishes only the name -> address record, under a private
+    service type, so Home Assistant's own ESPHome discovery is not triggered.
+    The address is the point-to-point one, so only this host can reach it.
+    """
+    name = (OPTS.get("announce_name") or "").strip().rstrip(".")
+    if name.endswith(".local"):
+        name = name[: -len(".local")]
+    if not name:
+        return None
+    try:
+        from zeroconf import IPVersion, ServiceInfo, Zeroconf
+
+        zc = Zeroconf(ip_version=IPVersion.V4Only)
+        info = ServiceInfo(
+            "_slipgateway._tcp.local.",
+            f"{name}._slipgateway._tcp.local.",
+            addresses=[socket.inet_aton(OPTS["peer_ip"])],
+            port=6053,
+            server=f"{name}.local.",
+            properties={"peer": OPTS["peer_ip"]},
+        )
+        zc.register_service(info)
+        log(f"mDNS: announcing {name}.local -> {OPTS['peer_ip']}")
+        return zc
+    except Exception as e:  # never let this optional feature stop the bridge
+        log(f"mDNS announcement failed: {e}")
+        return None
+
+
+def resolve_device():
+    """Return the serial port to use, or None.
+
+    `device` may be a plain path or a glob, e.g.
+    /dev/serial/by-id/usb-Silicon_Labs_CP2102*. A glob must match exactly one
+    port: with several serial adapters attached the script refuses to guess,
+    because SLIP written to the wrong port (a Zigbee stick, a meter reader)
+    would break whatever uses it.
+    """
+    pattern = OPTS["device"]
+    if any(c in pattern for c in "*?["):
+        matches = sorted(glob.glob(pattern))
+    else:
+        matches = [pattern] if os.path.exists(pattern) else []
+    if len(matches) > 1:
+        log(f"device pattern {pattern!r} matches {len(matches)} ports: {matches}; not guessing")
+        return None
+    return matches[0] if matches else None
+
+
+def list_candidates():
+    log("serial ports visible to this app (use the by-id path as `device`):")
+    by_id = {os.path.realpath(p): p for p in glob.glob("/dev/serial/by-id/*")}
+    ports = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+    if not ports:
+        log("  (none)")
+    for port in ports:
+        log(f"  {by_id.get(os.path.realpath(port), port)} -> {os.path.realpath(port)}")
+
+
+def open_serial(path):
     ser = serial.Serial()
-    ser.port = OPTS["device"]
+    ser.port = path
     ser.baudrate = int(OPTS["baud"])
     ser.timeout = 0
     # Keep DTR/RTS low so opening the port is less likely to reset the board
@@ -186,11 +253,22 @@ def main():
     ip("addr", "replace", OPTS["local_ip"], "peer", OPTS["peer_ip"], "dev", OPTS["ifname"])
     ip("link", "set", OPTS["ifname"], "mtu", str(OPTS["mtu"]), "up")
     log(f"{OPTS['ifname']} up: {OPTS['local_ip']} <-> {OPTS['peer_ip']}")
+    announcer = start_announcer()  # keep a reference so it stays alive
 
+    list_candidates()
+    last_listing = time.time()
     while True:  # reconnect if the USB device disappears
         try:
-            ser = open_serial()
-            log(f"serial open: {OPTS['device']}")
+            path = resolve_device()
+            if path is None:
+                if time.time() - last_listing >= 30:
+                    log(f"serial device {OPTS['device']!r} not found or ambiguous")
+                    list_candidates()
+                    last_listing = time.time()
+                time.sleep(3)
+                continue
+            ser = open_serial(path)
+            log(f"serial open: {path}")
             bridge(tun, ser)
         except (serial.SerialException, OSError) as e:
             log(f"serial error: {e}; retrying in 3 s")
