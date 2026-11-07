@@ -1,5 +1,5 @@
 name: SLIP gateway
-version: "0.2.0"
+version: "0.3.0"
 slug: slip_gateway
 description: SLIP serial link to an ESP32 (ESPHome), exposed as 192.168.254.1 <-> 192.168.254.2
 arch:

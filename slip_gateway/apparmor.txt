@@ -1,0 +1,58 @@
+#include <tunables/global>
+
+# AppArmor profile for the SLIP gateway app.
+#
+# The app only needs: the Python interpreter, `ip`, its own options file, the
+# TUN device, the serial port of the ESP32, and the network (UDP multicast for
+# the optional mDNS announcement, netlink for `ip`). Everything else is denied.
+#
+# If the app fails to start or stops working with "Permission denied" after
+# this profile is installed, add `complain` to the flags below (it then only
+# logs what it would have blocked), update the app, and look for
+# apparmor="ALLOWED" / apparmor="DENIED" lines in the host log.
+profile slip_gateway flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Capabilities: create the TUN interface and give it an address
+  capability net_admin,
+
+  # Network: mDNS and netlink (used by `ip`)
+  network,
+
+  # Let Docker / the Supervisor stop the app
+  signal (receive) peer=unconfined,
+
+  # Programs and libraries: Python, `ip` and what they load
+  /bin/** mrix,
+  /sbin/** mrix,
+  /usr/bin/** mrix,
+  /usr/sbin/** mrix,
+  /usr/local/bin/** mrix,
+  /lib/** mr,
+  /usr/lib/** mr,
+  /usr/local/lib/** mr,
+
+  # The app itself and its options
+  /slipgw.py r,
+  /data/** rw,
+  /tmp/** rw,
+
+  # System information read by Python, ip and the zeroconf library
+  /etc/** r,
+  /usr/share/** r,
+  /proc/** r,
+  /sys/** r,
+
+  # Devices: TUN and the serial ports (by-id names are symlinks to these)
+  /dev/ r,
+  /dev/net/tun rw,
+  /dev/ttyUSB[0-9]* rwk,
+  /dev/ttyACM[0-9]* rwk,
+  /dev/serial/** r,
+
+  # Never needed
+  deny mount,
+  deny umount,
+  deny /proc/sys/** w,
+  deny /sys/** w,
+}
