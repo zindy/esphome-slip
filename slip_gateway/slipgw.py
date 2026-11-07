@@ -10,6 +10,7 @@ import glob
 import json
 import os
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -103,6 +104,22 @@ def open_tun(name):
 
 def ip(*args):
     subprocess.run(["ip", *args], check=True)
+
+
+def install_signal_handlers():
+    """Exit cleanly (status 0) on SIGTERM/SIGINT.
+
+    As PID 1 in the container, Python ignores SIGTERM unless a handler is
+    installed. Stopping the app would then wait for the Supervisor's timeout
+    and kill the process (exit status 137), which Home Assistant shows as
+    "Error" instead of "Stopped".
+    """
+    def _exit(signum, frame):
+        log("stopping")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _exit)
+    signal.signal(signal.SIGINT, _exit)
 
 
 def start_announcer():
@@ -248,6 +265,7 @@ def bridge(tun, ser):
 
 def main():
     load_options()
+    install_signal_handlers()
     log(f"slip gateway: {OPTS}")
     tun = open_tun(OPTS["ifname"])
     ip("addr", "replace", OPTS["local_ip"], "peer", OPTS["peer_ip"], "dev", OPTS["ifname"])
@@ -257,22 +275,26 @@ def main():
 
     list_candidates()
     last_listing = time.time()
-    while True:  # reconnect if the USB device disappears
-        try:
-            path = resolve_device()
-            if path is None:
-                if time.time() - last_listing >= 30:
-                    log(f"serial device {OPTS['device']!r} not found or ambiguous")
-                    list_candidates()
-                    last_listing = time.time()
+    try:
+        while True:  # reconnect if the USB device disappears
+            try:
+                path = resolve_device()
+                if path is None:
+                    if time.time() - last_listing >= 30:
+                        log(f"serial device {OPTS['device']!r} not found or ambiguous")
+                        list_candidates()
+                        last_listing = time.time()
+                    time.sleep(3)
+                    continue
+                ser = open_serial(path)
+                log(f"serial open: {path}")
+                bridge(tun, ser)
+            except (serial.SerialException, OSError) as e:
+                log(f"serial error: {e}; retrying in 3 s")
                 time.sleep(3)
-                continue
-            ser = open_serial(path)
-            log(f"serial open: {path}")
-            bridge(tun, ser)
-        except (serial.SerialException, OSError) as e:
-            log(f"serial error: {e}; retrying in 3 s")
-            time.sleep(3)
+    finally:
+        if announcer is not None:
+            announcer.close()  # sends the mDNS goodbye so the name disappears
 
 
 if __name__ == "__main__":
